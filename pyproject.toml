@@ -1,0 +1,27 @@
+[project]
+name = "fraud-scoring-platform"
+version = "0.1.0"
+description = "Real-time fraud risk scoring platform"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn>=0.30,<1.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27,<1.0",
+    "pytest>=8,<10",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fraud_scoring"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
