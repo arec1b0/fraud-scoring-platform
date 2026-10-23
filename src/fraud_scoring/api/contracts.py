@@ -1,9 +1,16 @@
-"""Public request and response contracts for transaction scoring."""
+"""Public HTTP request and response contracts."""
 
 from decimal import Decimal
 from enum import StrEnum
+from typing import Literal, Self
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_validator,
+)
 
 
 class Decision(StrEnum):
@@ -33,3 +40,35 @@ class ScoreResponse(BaseModel):
     transaction_id: str
     risk_score: float = Field(ge=0, le=1)
     decision: Decision
+
+
+class FeedbackRequest(BaseModel):
+    """A terminal fraud label received after a transaction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_id: str = Field(
+        min_length=1,
+        max_length=64,
+        strict=True,
+    )
+    outcome: Literal["FRAUD", "LEGITIMATE"]
+    source: Literal["CHARGEBACK", "MANUAL_REVIEW"]
+    transaction_at: AwareDatetime
+    labeled_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_label_chronology(self) -> Self:
+        """Reject labels dated before their transactions."""
+        if self.labeled_at < self.transaction_at:
+            raise ValueError(
+                "labeled_at cannot precede transaction_at"
+            )
+        return self
+
+
+class FeedbackResponse(BaseModel):
+    """Result of feedback ingestion or idempotent replay."""
+
+    transaction_id: str
+    created: bool

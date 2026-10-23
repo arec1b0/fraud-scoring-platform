@@ -13,24 +13,43 @@ A Python-based platform for real-time fraud risk scoring.
 Run from the repository root:
 
 ```powershell
-uv sync
+uv sync --locked
 ```
 
 ## Run the API
 
+Create the local feedback data directory:
+
 ```powershell
-uv run uvicorn fraud_scoring.api.app:app --host 127.0.0.1 --port 8000
+New-Item -ItemType Directory -Force -Path data | Out-Null
 ```
 
-The API is available at:
+Configure the SQLite database path:
 
-- http://127.0.0.1:8000
-- http://127.0.0.1:8000/docs
-- http://127.0.0.1:8000/health
+```powershell
+$env:FRAUD_FEEDBACK_DB_PATH = Join-Path (Get-Location).Path "data\feedback.sqlite3"
+```
+
+Start the API:
+
+```powershell
+uv run --locked uvicorn fraud_scoring.api.app:app --host 127.0.0.1 --port 8000
+```
+
+Available routes:
+
+- `GET /health`
+- `POST /score`
+- `POST /feedback`
+- `GET /docs`
+
+Interactive documentation:
+
+http://127.0.0.1:8000/docs
 
 ## Scoring API
 
-`POST /score` accepts transaction data.
+`POST /score` validates transaction data.
 
 Example request:
 
@@ -45,30 +64,68 @@ Example request:
 }
 ```
 
-Amounts should be supplied as decimal strings to preserve precision.
+The scoring endpoint currently returns HTTP 503 with
+`SCORING_UNAVAILABLE` because decision-pipeline integration is
+not implemented.
 
-The API validates the request schema. At this stage, no scoring
-backend is configured, so valid requests return HTTP 503:
+## Delayed Feedback API
+
+`POST /feedback` receives verified terminal fraud labels.
+
+Example request:
 
 ```json
 {
-  "detail": {
-    "code": "SCORING_UNAVAILABLE",
-    "message": "A scoring backend is not configured."
-  }
+  "transaction_id": "txn-001",
+  "outcome": "FRAUD",
+  "source": "CHARGEBACK",
+  "transaction_at": "2026-10-23T08:00:00Z",
+  "labeled_at": "2026-10-25T08:00:00Z"
 }
 ```
 
-Invalid requests return HTTP 422.
+Possible outcomes:
 
-Once a scoring engine is implemented, successful responses will
-contain a risk score between 0 and 1 and a decision of APPROVE,
-REVIEW, or DECLINE.
+- `FRAUD`
+- `LEGITIMATE`
+
+Supported label sources:
+
+- `CHARGEBACK`
+- `MANUAL_REVIEW`
+
+HTTP responses:
+
+| Status | Meaning |
+|---|---|
+| 201 | New terminal feedback stored |
+| 200 | Exact feedback replay |
+| 409 | Conflicting feedback already exists |
+| 422 | Invalid request |
+| 503 | Feedback storage unavailable |
+
+Example response for newly stored feedback:
+
+```json
+{
+  "transaction_id": "txn-001",
+  "created": true
+}
+```
+
+Feedback is immutable. Correcting an existing label is not supported
+by this endpoint.
+
+The feedback database path must be configured using
+`FRAUD_FEEDBACK_DB_PATH`.
+
+This endpoint has no authentication and must not be exposed on
+a public network.
 
 ## Run tests
 
 ```powershell
-uv run pytest -q
+uv run --locked pytest -q
 ```
 
 ## Health check
@@ -89,10 +146,14 @@ Expected response:
 
 ## Current implementation
 
-- Python project configuration
-- FastAPI application
-- Health endpoint
-- Transaction scoring request/response contracts
-- Input validation
-- Explicit scoring-unavailable response
-- Automated API tests
+- FastAPI application and transaction contracts
+- Deterministic rule engine
+- Native LightGBM inference module
+- Redis online velocity feature storage
+- Parquet offline velocity history
+- Population Stability Index drift detector
+- Persistent delayed feedback storage
+- Feedback HTTP endpoint
+
+The scoring endpoint is not yet integrated with the rule engine,
+feature stores, or ML inference module.

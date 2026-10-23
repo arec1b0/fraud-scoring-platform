@@ -19,6 +19,12 @@ htmlcov/
 .env.*
 !.env.example
 
+# SQLite feedback data
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
 # IDE
 .idea/
 .vscode/
