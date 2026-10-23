@@ -12,7 +12,8 @@ dependencies = [
     "numpy>=2,<3",
     "redis>=6.2,<7",
     "pyarrow>=18,<30",
-    "tzdata>=2025.2 ; sys_platform == 'win32'",
+    "tzdata>=2025.2; sys_platform == 'win32'",
+    "prometheus-client>=0.21,<1",
 ]
 
 [dependency-groups]
