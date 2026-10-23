@@ -1,4 +1,3 @@
-
 """Tests for Redis-backed customer velocity features."""
 
 import json

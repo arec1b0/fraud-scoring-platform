@@ -1,4 +1,3 @@
-
 """Immutable Parquet storage for historical customer velocity features."""
 
 from collections.abc import Iterable

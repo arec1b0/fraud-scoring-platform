@@ -1,4 +1,3 @@
-
 """Redis-backed storage for customer transaction velocity snapshots."""
 
 import json

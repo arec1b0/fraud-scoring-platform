@@ -1,4 +1,3 @@
-
 """Tests for immutable Parquet-based offline feature storage."""
 
 from datetime import datetime, timedelta, timezone
