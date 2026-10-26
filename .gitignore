@@ -25,6 +25,9 @@ htmlcov/
 *.sqlite3-wal
 *.sqlite3-shm
 
+# Generated demonstration model
+/models/demo_fraud_model.txt
+
 # IDE
 .idea/
 .vscode/
