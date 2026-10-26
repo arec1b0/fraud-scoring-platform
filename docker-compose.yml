@@ -24,6 +24,19 @@ services:
       dockerfile: Dockerfile
     environment:
       FRAUD_REDIS_URL: "redis://redis:6379/0"
+      FRAUD_MODEL_PATH: "/app/models/demo_fraud_model.txt"
+      FRAUD_REVIEW_LIMITS_JSON: '{"CHF":"100.00"}'
+      FRAUD_BLOCKED_MERCHANT_IDS_JSON: '["merchant-demo-blocked"]'
+      FRAUD_REVIEW_THRESHOLD: "0.50"
+      FRAUD_DECLINE_THRESHOLD: "0.90"
+      FRAUD_MAX_FEATURE_AGE_SECONDS: "120"
+    volumes:
+      - type: bind
+        source: ./models/demo_fraud_model.txt
+        target: /app/models/demo_fraud_model.txt
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       redis:
         condition: service_healthy
