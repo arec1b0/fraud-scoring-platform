@@ -233,3 +233,98 @@ jobs:
               throw "Container cleanup failed"
             }
           }
+
+  live-scoring:
+    name: Full-stack scoring integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      GRAFANA_ADMIN_PASSWORD: ci-only-unused-password
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.4"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          uv sync --locked --dev
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Dependency synchronization failed"
+          }
+
+      - name: Generate synthetic demonstration model
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path models |
+            Out-Null
+
+          uv run --locked python -m fraud_scoring.scoring.train_demo `
+            --output models/demo_fraud_model.txt `
+            --seed 42
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Synthetic model generation failed"
+          }
+
+      - name: Validate Docker Compose configuration
+        shell: pwsh
+        run: |
+          docker compose config --quiet
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Docker Compose configuration is invalid"
+          }
+
+      - name: Start Redis API and Prometheus
+        shell: pwsh
+        run: |
+          docker compose up --detach --build --wait `
+            --wait-timeout 180 `
+            api prometheus
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Full-stack startup failed"
+          }
+
+          docker compose ps
+
+      - name: Verify real scoring pipeline
+        shell: pwsh
+        run: |
+          uv run --locked python -m fraud_scoring.monitoring.stack_smoke `
+            --api-url http://127.0.0.1:8000 `
+            --prometheus-url http://127.0.0.1:9090 `
+            --model-path models/demo_fraud_model.txt
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Live scoring integration failed"
+          }
+
+      - name: Print integration logs on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          docker compose logs --tail 100 redis api prometheus
+
+      - name: Stop integration containers
+        if: always()
+        shell: pwsh
+        run: |
+          docker compose down --remove-orphans
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Integration container cleanup failed"
+          }
