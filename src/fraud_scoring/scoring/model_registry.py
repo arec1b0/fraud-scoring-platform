@@ -1,7 +1,7 @@
 """Local, synthetic-only LightGBM model registry.
 
-Registered artifacts and manifests are immutable through this API.
-STAGING promotion is explicit and does not deploy a model.
+Artifacts, manifests and evaluation reports use exclusive creation.
+STAGING promotion never deploys or production-approves a model.
 """
 
 import argparse
@@ -16,6 +16,10 @@ from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
 
+from fraud_scoring.scoring.evaluation import (
+    enforce_quality_policy,
+    make_evaluation_report,
+)
 from fraud_scoring.scoring.ml import LightGBMScorer
 
 
@@ -39,7 +43,6 @@ def _validate_version(version: str) -> str:
             "Version must be 1-64 ASCII letters, digits, "
             "dots, underscores or hyphens; 'none' is reserved"
         )
-
     return version
 
 
@@ -54,6 +57,10 @@ def _paths(
     )
 
 
+def _evidence_path(root: Path, version: str) -> Path:
+    return root / "evaluations" / f"{_validate_version(version)}.json"
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
 
@@ -65,7 +72,7 @@ def _sha256(path: Path) -> str:
 
 
 def _check_model(path: Path) -> None:
-    """Require exact feature schema and valid binary inference."""
+    """Require the production inference interface, not its accuracy."""
     scorer = LightGBMScorer(path)
 
     if tuple(scorer.feature_names) != FEATURE_NAMES:
@@ -118,7 +125,7 @@ def _read_object(path: Path) -> dict[str, object]:
 
 @contextmanager
 def _writer_lock(root: Path) -> Iterator[None]:
-    """Serialize cooperative registry writers using atomic mkdir."""
+    """Serialize cooperative writers using atomic mkdir."""
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / ".write.lock"
 
@@ -189,12 +196,7 @@ def register_demo_model(
                 newline="\n",
             ) as stream:
                 manifest_created = True
-                json.dump(
-                    manifest,
-                    stream,
-                    indent=2,
-                    sort_keys=True,
-                )
+                json.dump(manifest, stream, indent=2, sort_keys=True)
                 stream.write("\n")
 
             return manifest
@@ -210,7 +212,7 @@ def verify_registered(
     root: Path,
     version: str,
 ) -> dict[str, object]:
-    """Verify artifact integrity and the inference contract."""
+    """Verify artifact integrity and inference compatibility."""
     root = Path(root)
     artifact_path, manifest_path = _paths(root, version)
     manifest = _read_object(manifest_path)
@@ -239,14 +241,75 @@ def verify_registered(
         raise RegistryError("Invalid model SHA-256 metadata")
 
     if artifact_path.is_symlink() or not artifact_path.is_file():
-        raise RegistryError("Registered model artifact is missing or unsafe")
+        raise RegistryError(
+            "Registered model artifact is missing or unsafe"
+        )
 
     if _sha256(artifact_path) != digest:
         raise RegistryError("Registered model SHA-256 mismatch")
 
     _check_model(artifact_path)
-
     return manifest
+
+
+def evaluate_registered(
+    root: Path,
+    version: str,
+) -> dict[str, object]:
+    """Generate evidence once for a registered synthetic model."""
+    root = Path(root)
+
+    with _writer_lock(root):
+        manifest = verify_registered(root, version)
+        evidence_path = _evidence_path(root, version)
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if evidence_path.exists() or evidence_path.is_symlink():
+            raise RegistryError(
+                f"Evaluation evidence already exists: {version}"
+            )
+
+        artifact_path, _ = _paths(root, version)
+
+        report = make_evaluation_report(
+            version=version,
+            artifact_path=artifact_path,
+            artifact_sha256=manifest["sha256"],
+        )
+
+        _write_json_exclusive(evidence_path, report)
+        return report
+
+
+def verify_evaluation(
+    root: Path,
+    version: str,
+) -> dict[str, object]:
+    """Recompute and compare all evidence fields with the saved report."""
+    root = Path(root)
+    manifest = verify_registered(root, version)
+    evidence_path = _evidence_path(root, version)
+
+    if not evidence_path.is_file() or evidence_path.is_symlink():
+        raise RegistryError(
+            f"Missing or unsafe evaluation evidence: {version}"
+        )
+
+    stored = _read_object(evidence_path)
+    artifact_path, _ = _paths(root, version)
+
+    expected = make_evaluation_report(
+        version=version,
+        artifact_path=artifact_path,
+        artifact_sha256=manifest["sha256"],
+    )
+
+    if stored != expected:
+        raise RegistryError(
+            f"Evaluation evidence mismatch: {version}"
+        )
+
+    return stored
 
 
 def _read_staging_pointer(
@@ -286,7 +349,7 @@ def promote_to_staging(
     expected_current: str | None,
     confirm: bool,
 ) -> dict[str, object]:
-    """Manually update STAGING with integrity and concurrency gates."""
+    """Promote only with valid evidence and baseline safety gates."""
     root = Path(root)
     _validate_version(version)
 
@@ -312,6 +375,34 @@ def promote_to_staging(
                 f"{expected_current!r}, found {current_version!r}"
             )
 
+        candidate_report = verify_evaluation(root, version)
+
+        baseline_report = None
+
+        if current_version is not None and current_version != version:
+            baseline_manifest = verify_registered(
+                root,
+                current_version,
+            )
+
+            if current["sha256"] != baseline_manifest["sha256"]:
+                raise RegistryError(
+                    "Staging digest differs from registered artifact"
+                )
+
+            baseline_report = verify_evaluation(
+                root,
+                current_version,
+            )
+
+        try:
+            enforce_quality_policy(
+                candidate_report,
+                baseline=baseline_report,
+            )
+        except ValueError as exc:
+            raise RegistryError(str(exc)) from exc
+
         pointer: dict[str, object] = {
             "stage": "STAGING",
             "version": version,
@@ -331,7 +422,7 @@ def promote_to_staging(
 
 
 def verify_staging(root: Path) -> dict[str, object]:
-    """Verify that STAGING points to a valid, unchanged artifact."""
+    """Require valid model integrity and evaluation for STAGING."""
     root = Path(root)
     pointer = _read_staging_pointer(root)
 
@@ -346,11 +437,18 @@ def verify_staging(root: Path) -> dict[str, object]:
             "Staging digest differs from registered artifact"
         )
 
+    report = verify_evaluation(root, version)
+
+    try:
+        enforce_quality_policy(report)
+    except ValueError as exc:
+        raise RegistryError(str(exc)) from exc
+
     return pointer
 
 
 def main() -> int:
-    """Provide explicit registration and staging lifecycle commands."""
+    """Manage registration, evaluation and manual staging promotion."""
     parser = argparse.ArgumentParser(
         description="Synthetic-only local LightGBM model registry"
     )
@@ -371,6 +469,12 @@ def main() -> int:
 
     verify = commands.add_parser("verify")
     verify.add_argument("--version", required=True)
+
+    evaluate = commands.add_parser("evaluate")
+    evaluate.add_argument("--version", required=True)
+
+    verify_evidence = commands.add_parser("verify-evaluation")
+    verify_evidence.add_argument("--version", required=True)
 
     promote = commands.add_parser("promote-staging")
     promote.add_argument("--version", required=True)
@@ -397,6 +501,16 @@ def main() -> int:
             )
         elif args.command == "verify":
             result = verify_registered(
+                args.registry,
+                args.version,
+            )
+        elif args.command == "evaluate":
+            result = evaluate_registered(
+                args.registry,
+                args.version,
+            )
+        elif args.command == "verify-evaluation":
+            result = verify_evaluation(
                 args.registry,
                 args.version,
             )

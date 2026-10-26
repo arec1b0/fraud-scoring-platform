@@ -1,4 +1,4 @@
-"""Tests for immutable demo-model registration and staging gates."""
+"""Tests for immutable model registration and evidence-gated promotion."""
 
 import hashlib
 import json
@@ -8,8 +8,10 @@ import pytest
 
 from fraud_scoring.scoring.model_registry import (
     RegistryError,
+    evaluate_registered,
     promote_to_staging,
     register_demo_model,
+    verify_evaluation,
     verify_registered,
     verify_staging,
 )
@@ -24,6 +26,16 @@ def demo_model(
     model_path = root / "demo.txt"
     train_demo_model(model_path)
     return model_path
+
+
+def register_with_evidence(
+    root: Path,
+    model: Path,
+    version: str,
+) -> dict[str, object]:
+    manifest = register_demo_model(root, model, version)
+    evaluate_registered(root, version)
+    return manifest
 
 
 def test_registers_immutable_candidate(
@@ -136,10 +148,7 @@ def test_manifest_tampering_is_detected(
 ) -> None:
     register_demo_model(tmp_path, demo_model, "demo-v1")
 
-    manifest_path = (
-        tmp_path / "manifests" / "demo-v1.json"
-    )
-
+    manifest_path = tmp_path / "manifests" / "demo-v1.json"
     manifest = json.loads(
         manifest_path.read_text(encoding="utf-8")
     )
@@ -181,7 +190,7 @@ def test_first_staging_promotion(
     tmp_path: Path,
     demo_model: Path,
 ) -> None:
-    register_demo_model(tmp_path, demo_model, "demo-v1")
+    register_with_evidence(tmp_path, demo_model, "demo-v1")
 
     pointer = promote_to_staging(
         tmp_path,
@@ -200,8 +209,8 @@ def test_stale_expected_version_is_rejected(
     tmp_path: Path,
     demo_model: Path,
 ) -> None:
-    register_demo_model(tmp_path, demo_model, "demo-v1")
-    register_demo_model(tmp_path, demo_model, "demo-v2")
+    register_with_evidence(tmp_path, demo_model, "demo-v1")
+    register_with_evidence(tmp_path, demo_model, "demo-v2")
 
     promote_to_staging(
         tmp_path,
@@ -228,8 +237,8 @@ def test_staging_switch_requires_matching_current(
     tmp_path: Path,
     demo_model: Path,
 ) -> None:
-    register_demo_model(tmp_path, demo_model, "demo-v1")
-    register_demo_model(tmp_path, demo_model, "demo-v2")
+    register_with_evidence(tmp_path, demo_model, "demo-v1")
+    register_with_evidence(tmp_path, demo_model, "demo-v2")
 
     promote_to_staging(
         tmp_path,
@@ -253,7 +262,7 @@ def test_staging_pointer_tampering_is_detected(
     tmp_path: Path,
     demo_model: Path,
 ) -> None:
-    register_demo_model(tmp_path, demo_model, "demo-v1")
+    register_with_evidence(tmp_path, demo_model, "demo-v1")
 
     promote_to_staging(
         tmp_path,
@@ -327,3 +336,178 @@ def test_tampered_model_cannot_be_promoted(
         )
 
     assert not (tmp_path / "staging.json").exists()
+
+
+def test_missing_evidence_prevents_promotion(
+    tmp_path: Path,
+    demo_model: Path,
+) -> None:
+    register_demo_model(tmp_path, demo_model, "demo-v1")
+
+    with pytest.raises(
+        RegistryError,
+        match="Missing or unsafe evaluation evidence",
+    ):
+        promote_to_staging(
+            tmp_path,
+            "demo-v1",
+            expected_current=None,
+            confirm=True,
+        )
+
+    assert not (tmp_path / "staging.json").exists()
+
+
+def test_evaluation_report_is_reproducible(
+    tmp_path: Path,
+    demo_model: Path,
+) -> None:
+    manifest = register_demo_model(
+        tmp_path,
+        demo_model,
+        "demo-v1",
+    )
+
+    report = evaluate_registered(tmp_path, "demo-v1")
+
+    assert report["version"] == "demo-v1"
+    assert report["artifact_sha256"] == manifest["sha256"]
+    assert report["dataset_origin"] == "synthetic"
+    assert report["evaluation_rows"] == 1024
+    assert report["production_approved"] is False
+    assert set(report["metrics"]) == {
+        "roc_auc",
+        "pr_auc",
+        "precision",
+        "recall",
+        "f1",
+        "brier_score",
+    }
+    assert verify_evaluation(tmp_path, "demo-v1") == report
+
+
+def test_duplicate_evaluation_cannot_overwrite_report(
+    tmp_path: Path,
+    demo_model: Path,
+) -> None:
+    register_with_evidence(tmp_path, demo_model, "demo-v1")
+
+    evidence_path = tmp_path / "evaluations" / "demo-v1.json"
+    original_bytes = evidence_path.read_bytes()
+
+    with pytest.raises(
+        RegistryError,
+        match="already exists",
+    ):
+        evaluate_registered(tmp_path, "demo-v1")
+
+    assert evidence_path.read_bytes() == original_bytes
+
+
+def test_evaluation_tampering_blocks_promotion(
+    tmp_path: Path,
+    demo_model: Path,
+) -> None:
+    register_with_evidence(tmp_path, demo_model, "demo-v1")
+
+    evidence_path = tmp_path / "evaluations" / "demo-v1.json"
+    evidence = json.loads(
+        evidence_path.read_text(encoding="utf-8")
+    )
+    evidence["metrics"]["roc_auc"] = 0.99
+
+    evidence_path.write_text(
+        json.dumps(evidence),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RegistryError,
+        match="Evaluation evidence mismatch",
+    ):
+        promote_to_staging(
+            tmp_path,
+            "demo-v1",
+            expected_current=None,
+            confirm=True,
+        )
+
+    assert not (tmp_path / "staging.json").exists()
+
+
+def test_existing_staging_requires_evaluation_migration(
+    tmp_path: Path,
+    demo_model: Path,
+) -> None:
+    manifest = register_demo_model(
+        tmp_path,
+        demo_model,
+        "demo-v1",
+    )
+
+    legacy_pointer = {
+        "stage": "STAGING",
+        "version": "demo-v1",
+        "sha256": manifest["sha256"],
+        "production_approved": False,
+    }
+
+    (tmp_path / "staging.json").write_text(
+        json.dumps(legacy_pointer),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RegistryError,
+        match="Missing or unsafe evaluation evidence",
+    ):
+        verify_staging(tmp_path)
+
+    evaluate_registered(tmp_path, "demo-v1")
+
+    assert verify_staging(tmp_path) == legacy_pointer
+
+
+def test_missing_baseline_evidence_blocks_switch(
+    tmp_path: Path,
+    demo_model: Path,
+) -> None:
+    baseline = register_demo_model(
+        tmp_path,
+        demo_model,
+        "demo-v1",
+    )
+    register_with_evidence(
+        tmp_path,
+        demo_model,
+        "demo-v2",
+    )
+
+    legacy_pointer = {
+        "stage": "STAGING",
+        "version": "demo-v1",
+        "sha256": baseline["sha256"],
+        "production_approved": False,
+    }
+
+    (tmp_path / "staging.json").write_text(
+        json.dumps(legacy_pointer),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RegistryError,
+        match="Missing or unsafe evaluation evidence",
+    ):
+        promote_to_staging(
+            tmp_path,
+            "demo-v2",
+            expected_current="demo-v1",
+            confirm=True,
+        )
+
+    assert json.loads(
+        (tmp_path / "staging.json").read_text(
+            encoding="utf-8"
+        )
+    ) == legacy_pointer
