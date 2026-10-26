@@ -28,6 +28,9 @@ htmlcov/
 # Generated demonstration model
 /models/demo_fraud_model.txt
 
+# Local model registry state
+/data/model_registry/
+
 # IDE
 .idea/
 .vscode/
